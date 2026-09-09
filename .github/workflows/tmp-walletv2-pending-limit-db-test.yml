@@ -1,0 +1,135 @@
+name: Temporary walletv2 pending limit DB verifier
+
+on:
+  push:
+    branches:
+      - verify/walletv2-pending-limit-db-test
+
+permissions:
+  contents: write
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt,clippy
+
+      - name: Strengthen pending transaction limit regression
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('modules/fedimint-walletv2-server/src/lib.rs')
+          text = path.read_text()
+
+          old = '''fn validate_pending_transaction_count(count: usize) -> Result<(), PendingTransactionLimitError> {
+              if count > MAX_PENDING_TRANSACTIONS {
+                  return Err(PendingTransactionLimitError);
+              }
+
+              Ok(())
+          }
+          '''
+          new = '''async fn pending_txs_within_limit(
+              dbtx: &mut DatabaseTransaction<'_>,
+          ) -> Result<Vec<FederationTx>, PendingTransactionLimitError> {
+              let pending_txs = pending_txs_unordered(dbtx).await;
+              if pending_txs.len() > MAX_PENDING_TRANSACTIONS {
+                  return Err(PendingTransactionLimitError);
+              }
+
+              Ok(pending_txs)
+          }
+          '''
+          if text.count(old) != 1:
+              raise SystemExit('expected pending count helper exactly once')
+          text = text.replace(old, new)
+
+          old = '''        let pending_txs = pending_txs_unordered(dbtx).await;
+                  validate_pending_transaction_count(pending_txs.len())?;
+          '''
+          new = '''        let pending_txs = pending_txs_within_limit(dbtx).await?;
+          '''
+          if text.count(old) != 1:
+              raise SystemExit('expected try_consensus_fee pending check exactly once')
+          text = text.replace(old, new)
+
+          start = text.index('#[cfg(test)]\nmod tests {')
+          text = text[:start] + '''#[cfg(test)]
+          mod tests {
+              use fedimint_core::db::mem_impl::MemDatabase;
+              use fedimint_core::module::registry::ModuleRegistry;
+
+              use super::*;
+
+              fn dummy_federation_tx() -> FederationTx {
+                  FederationTx {
+                      tx: Transaction {
+                          version: Version::TWO,
+                          lock_time: LockTime::ZERO,
+                          input: vec![],
+                          output: vec![],
+                      },
+                      spent_tx_outs: vec![],
+                      vbytes: 0,
+                      fee: Amount::ZERO,
+                  }
+              }
+
+              #[tokio::test]
+              async fn pending_transaction_limit_checks_database_stack() {
+                  let db = Database::new(MemDatabase::new(), ModuleRegistry::default());
+                  let mut dbtx = db.begin_transaction_nc().await;
+                  let pending_tx = dummy_federation_tx();
+
+                  for index in 0..MAX_PENDING_TRANSACTIONS {
+                      let txid = Txid::from_byte_array([index as u8; 32]);
+                      dbtx.insert_new_entry(&UnsignedTxKey(txid), &pending_tx).await;
+                  }
+
+                  let pending_txs = pending_txs_within_limit(&mut dbtx)
+                      .await
+                      .expect("the configured pending transaction limit should be accepted");
+                  assert_eq!(pending_txs.len(), MAX_PENDING_TRANSACTIONS);
+
+                  let txid = Txid::from_byte_array([MAX_PENDING_TRANSACTIONS as u8; 32]);
+                  dbtx.insert_new_entry(&UnconfirmedTxKey(txid), &pending_tx)
+                      .await;
+
+                  assert_eq!(
+                      pending_txs_within_limit(&mut dbtx).await,
+                      Err(PendingTransactionLimitError)
+                  );
+              }
+          }
+          '''
+          path.write_text(text)
+          PY
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Test walletv2 server
+        run: cargo test -p fedimint-walletv2-server
+
+      - name: Clippy walletv2 server
+        run: cargo clippy -p fedimint-walletv2-server --all-targets --no-deps -- -D warnings
+
+      - name: Commit verified source change
+        if: success()
+        shell: bash
+        run: |
+          cargo fmt --all
+          git config user.name 'v ₿'
+          git config user.email 'valentin.brekher@gmail.com'
+          git rm .github/workflows/tmp-walletv2-pending-limit-db-test.yml
+          git add modules/fedimint-walletv2-server/src/lib.rs
+          git commit -m 'test(walletv2): cover pending limit from database state'
+          git push origin HEAD:verify/walletv2-pending-limit-db-test
