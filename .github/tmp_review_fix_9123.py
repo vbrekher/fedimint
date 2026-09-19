@@ -160,8 +160,8 @@ lib.write_text(text.replace(old, new, 1))
 
 cargo = Path("modules/fedimint-walletv2-server/Cargo.toml")
 text = cargo.read_text()
-marker = '''tracing = { workspace = true }\n\n[lints]\n'''
-replacement = '''tracing = { workspace = true }\n\n[dev-dependencies]\ntokio = { workspace = true, features = ["macros", "rt"] }\n\n[lints]\n'''
+marker = 'tracing = { workspace = true }\n'
+replacement = '''tracing = { workspace = true }\n\n[dev-dependencies]\ntokio = { workspace = true, features = ["macros", "rt"] }\n'''
 if text.count(marker) != 1:
     raise SystemExit("expected Cargo.toml dependency footer exactly once")
 cargo.write_text(text.replace(marker, replacement, 1))
